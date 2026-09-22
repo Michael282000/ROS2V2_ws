@@ -7,7 +7,7 @@ launch before running this script.
 """
 
 import rclpy
-from dsr_msgs2.srv import GetCurrentPosj
+from dsr_msgs2.srv import GetCurrentPosj, MoveJoint
 
 
 # =========================== USER SETTINGS ============================
@@ -52,6 +52,9 @@ def read_joint_position(node, client, label):
     for number, angle in enumerate(position, start=1):
         print(f"  J{number}: {angle}")
     return position
+
+
+
 
 
 def main():
