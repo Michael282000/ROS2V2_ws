@@ -25,8 +25,3 @@ def test_copyright():
     rc = main(argv=['.', 'test'])
     assert rc == 0, 'Found errors'
 
-#hygb
-##optie 2S
-#broodje kaas
-#ik hou van kaas met extra kaas
-#ik heb honger
