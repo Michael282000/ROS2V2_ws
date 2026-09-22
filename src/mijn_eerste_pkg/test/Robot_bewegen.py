@@ -22,7 +22,25 @@ ROBOT_ID = "dsr01"
 CONTROLLER_NAMESPACE = f"/{ROBOT_ID}/dsr_controller2"
 POSITION_SERVICE = f"{CONTROLLER_NAMESPACE}/aux_control/get_current_posj"
 SERVICE_TIMEOUT_SECONDS = 10.0
+MOVE_JOINT_SERVICE = f"{CONTROLLER_NAMESPACE}/motion/move_joint"
 
+#toevoeging robot bewegen
+def move_joint(node, client):
+    request = MoveJoint.Request()
+
+    request.pos = [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
+    request.vel = 30.0
+    request.acc = 30.0
+
+    future = client.call_async(request)
+    rclpy.spin_until_future_complete(node, future)
+
+    response = future.result()
+
+    if response is None:
+        raise RuntimeError("Move joint failed")
+
+    print("Move joint command sent")
 
 def wait_for_service(client, name):
     """Wait once for a service and show an error if it is unavailable."""
@@ -60,20 +78,35 @@ def read_joint_position(node, client, label):
 def main():
     if ROBOT_MODE not in ("virtual", "real"):
         raise ValueError('ROBOT_MODE must be "virtual" or "real".')
+
     rclpy.init()
     node = rclpy.create_node("robot_bewegen")
-    position_client = node.create_client(GetCurrentPosj, POSITION_SERVICE)
+
+    position_client = node.create_client(
+        GetCurrentPosj,
+        POSITION_SERVICE
+    )
+
+    move_client = node.create_client(
+        MoveJoint,
+        MOVE_JOINT_SERVICE
+    )
 
     try:
         print(f"Doosan mode selected in this file: {ROBOT_MODE}")
-        if not wait_for_service(position_client, POSITION_SERVICE):
+
+        if not wait_for_service(move_client, MOVE_JOINT_SERVICE):
             return 1
-        read_joint_position(node, position_client, "Current")
-        print("Done: no robot movement was commanded.")
+
+        move_joint(node, move_client)
+
+        print("Done: robot movement command completed.")
         return 0
+
     except RuntimeError as error:
         print(f"Error: {error}")
         return 2
+
     finally:
         node.destroy_node()
         rclpy.shutdown()
