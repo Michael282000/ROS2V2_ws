@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""Read Doosan joint positions and optionally move with MoveJoint.
+"""Read Doosan joint positions and move safely to joint coordinates.
 
-Set ENABLE_MOTION to True only after verifying TARGET_JOINTS_DEG is safe.
+For a virtual test, launch the Doosan virtual/simulation bringup first and set
+ROBOT_MODE = "virtual". After verifying the motion there, switch to "real"
+and launch the real robot bringup. This script connects to whichever controller
+is currently running; ROBOT_MODE is a safety/status check, not a simulator switch.
 """
 
 import rclpy
 from dsr_msgs2.srv import GetCurrentPosj, MoveJoint
 
 # =========================== USER SETTINGS ============================
-ROBOT_MODE = "real"  # "virtual" or "real"; used in status messages.
+# Start with "virtual" and a virtual Doosan bringup. Change to "real" only
+# when the target and path have been checked in the virtual environment.
+ROBOT_MODE = "real"  # "virtual" or "real"
 ROBOT_ID = "dsr01"
 
-# Change these six target angles (degrees) only after checking the path.
+# Absolute joint target: [J1, J2, J3, J4, J5, J6], in degrees.
 TARGET_JOINTS_DEG = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 MOVE_VELOCITY_DEG_S = 5.0
 MOVE_ACCELERATION_DEG_S2 = 5.0
 
-# Safety switch: the robot moves only when this is explicitly True.
+# False: read and display current joints and target, but do not move.
+# True: execute MoveJoint on the connected virtual or real controller.
 ENABLE_MOTION = True
 # =======================================================================
 
@@ -25,21 +31,23 @@ RESPONSE_TIMEOUT = 30.0
 
 CONTROLLER_NAMESPACE = f"/{ROBOT_ID}/dsr_controller2"
 POSITION_SERVICE = f"{CONTROLLER_NAMESPACE}/aux_control/get_current_posj"
-MOVE_JOINT_SERVICE = f"/{ROBOT_ID}/motion/move_joint"
+MOVE_JOINT_SERVICE = (
+    f"/{ROBOT_ID}/dsr_controller2/motion/move_joint"
+)
 
 
 def wait_for_service(client, service_name):
-    """Wait for one ROS service and raise a readable error if unavailable."""
+    """Wait for one ROS service or raise a clear error."""
     print(f"Waiting for service: {service_name}")
     if not client.wait_for_service(timeout_sec=SERVICE_TIMEOUT):
         raise RuntimeError(
-            f"Service not found: {service_name}. Start Doosan bringup in "
-            f"{ROBOT_MODE} mode and verify ROBOT_ID ({ROBOT_ID})."
+            f"Service not found: {service_name}. Start the Doosan {ROBOT_MODE} "
+            f"bringup and verify ROBOT_ID ({ROBOT_ID})."
         )
 
 
 def call_service(node, client, request, description):
-    """Call a ROS service and wait for its response with a timeout."""
+    """Call a ROS service and wait for its response."""
     future = client.call_async(request)
     rclpy.spin_until_future_complete(node, future, timeout_sec=RESPONSE_TIMEOUT)
 
@@ -52,38 +60,49 @@ def call_service(node, client, request, description):
     return response
 
 
-def get_joint_positions(node, client):
-    """Return the current six joint angles in degrees."""
+def get_joint_positions(node, position_client):
+    """Read and return the current six joint angles in degrees."""
     response = call_service(
-        node, client, GetCurrentPosj.Request(), "the joint-position response"
+        node,
+        position_client,
+        GetCurrentPosj.Request(),
+        "the current joint-position response",
     )
-    return [round(angle, 3) for angle in response.pos]
+    return [float(angle) for angle in response.pos]
 
 
 def print_joint_positions(title, positions):
-    """Print six joint angles in a consistent format."""
+    """Print an ordered six-joint position in degrees."""
     print(f"{title}:")
     for index, angle in enumerate(positions, start=1):
         print(f"  J{index}: {angle:.3f}°")
 
 
-def move_joint(node, client):
-    """Send one absolute, synchronous MoveJoint command."""
-    if len(TARGET_JOINTS_DEG) != 6:
-        raise ValueError("TARGET_JOINTS_DEG must contain exactly six angles.")
+def move_to_joint_coordinates(
+    node,
+    move_client,
+    joints_deg,
+    velocity_deg_s=MOVE_VELOCITY_DEG_S,
+    acceleration_deg_s2=MOVE_ACCELERATION_DEG_S2,
+):
+    """Move absolutely and synchronously to [J1, J2, J3, J4, J5, J6] in degrees."""
+    if len(joints_deg) != 6:
+        raise ValueError("Joint coordinates must contain exactly six angles.")
+    if velocity_deg_s <= 0 or acceleration_deg_s2 <= 0:
+        raise ValueError("Velocity and acceleration must be greater than zero.")
 
     request = MoveJoint.Request()
-    request.pos = [float(angle) for angle in TARGET_JOINTS_DEG]
-    request.vel = float(MOVE_VELOCITY_DEG_S)
-    request.acc = float(MOVE_ACCELERATION_DEG_S2)
+    request.pos = [float(angle) for angle in joints_deg]
+    request.vel = float(velocity_deg_s)
+    request.acc = float(acceleration_deg_s2)
     request.time = 0.0
     request.radius = 0.0
     request.mode = 0       # Absolute joint target.
     request.blend_type = 0
-    request.sync_type = 0  # Wait until this motion has completed.
+    request.sync_type = 0  # Return only after the movement completes.
 
-    print_joint_positions("Target joint position", request.pos)
-    call_service(node, client, request, "the MoveJoint command")
+    print_joint_positions("Target joint coordinates", request.pos)
+    call_service(node, move_client, request, "the MoveJoint command")
     print("MoveJoint completed.")
 
 
@@ -98,17 +117,29 @@ def main():
         position_client = node.create_client(GetCurrentPosj, POSITION_SERVICE)
         move_client = node.create_client(MoveJoint, MOVE_JOINT_SERVICE)
 
-        print(f"Doosan mode: {ROBOT_MODE}")
+        print(f"Connected mode: {ROBOT_MODE}")
         wait_for_service(position_client, POSITION_SERVICE)
-        print_joint_positions("Current joint position", get_joint_positions(node, position_client))
+
+        # This is always performed before any possible movement.
+        current_joints = get_joint_positions(node, position_client)
+        print_joint_positions("Current joint position before motion", current_joints)
+        print_joint_positions("Configured target joint position", TARGET_JOINTS_DEG)
 
         if not ENABLE_MOTION:
-            print("Motion disabled: set ENABLE_MOTION = True after checking the target.")
+            print("Motion is disabled: no MoveJoint command was sent.")
             return 0
 
         wait_for_service(move_client, MOVE_JOINT_SERVICE)
-        move_joint(node, move_client)
-        print_joint_positions("Final joint position", get_joint_positions(node, position_client))
+        move_to_joint_coordinates(
+            node,
+            move_client,
+            TARGET_JOINTS_DEG,
+            MOVE_VELOCITY_DEG_S,
+            MOVE_ACCELERATION_DEG_S2,
+        )
+
+        final_joints = get_joint_positions(node, position_client)
+        print_joint_positions("Current joint position after motion", final_joints)
         return 0
     except (RuntimeError, ValueError) as error:
         print(f"Error: {error}")
