@@ -16,7 +16,7 @@ The complete script is preflighted before the first motion command.
 
 import json
 import math
-import time
+
 from dataclasses import dataclass
 from pathlib import Path
 
