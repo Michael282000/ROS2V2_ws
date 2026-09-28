@@ -26,7 +26,7 @@ from dsr_msgs2.srv import GetCurrentPosj, Ikin, MoveJoint, MoveJointx
 # =========================== USER SETTINGS ============================
 ROBOT_MODE = "virtual"  # Test virtual first; change to "real" only when safe.
 ROBOT_ID = "dsr01"
-INSTRUCTION_FILE = Path("Human_instructions.json")
+INSTRUCTION_FILE = Path("/home/bbrug1/ROS2V2_ws/src/mijn_eerste_pkg/test/Human.json")
 ENABLE_MOTION = True
 
 # Initial modal values. PTP values are fractions of the configured PTP maxima.
