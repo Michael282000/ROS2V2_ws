@@ -1,5 +1,5 @@
 [
-  {"task": "set", "param": "max-velocity", "value": 0.5},
+  {"task": "set", "param": "max-velocity", "value":0.5},
   {"task": "set", "param": "max-acceleration", "value": 0.5},
   {"task": "wait", "value": 8},
   {"task": "move_joint", "value": [0, -30, 60, 0, 60, 0]},
