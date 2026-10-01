@@ -13,7 +13,7 @@ from dsr_msgs2.srv import GetCurrentPosj, MoveJoint
 # =========================== USER SETTINGS ============================
 # Start with "virtual" and a virtual Doosan bringup. Change to "real" only
 # when the target and path have been checked in the virtual environment.
-ROBOT_MODE = "virtual"  # "virtual" or "real"
+ROBOT_MODE = "real"  # "virtual" or "real"
 ROBOT_ID = "dsr01"
 
 # Absolute joint target: [J1, J2, J3, J4, J5, J6], in degrees.
@@ -23,7 +23,7 @@ MOVE_ACCELERATION_DEG_S2 = 5.0
 
 # False: read and display current joints and target, but do not move.
 # True: execute MoveJoint on the connected virtual or real controller.
-ENABLE_MOTION = True
+ENABLE_MOTION = False
 # =======================================================================
 
 SERVICE_TIMEOUT = 10.0
