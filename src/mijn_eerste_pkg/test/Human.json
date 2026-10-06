@@ -1,15 +1,38 @@
 [
-  {"task": "set", "param": "max-velocity", "value": 0.5},
-  {"task": "set", "param": "max-acceleration", "value": 0.5},
+  {"task": "set", "param": "max-velocity", "value": 0.01},
+  {"task": "set", "param": "max-acceleration", "value": 0.01},
+  {"task": "wait", "value": 6.0},
   {"task": "move_joint", "value": [0, -30, 60, 0, 60, 0]},
   {
-    "task": "move-ee",
-    "mode": "ptp",
-    "pose": {
-      "pos": [0.40, -0.10, 0.25],
-      "quat": [0.0, 0.7071, 0.7071, 0.0]
-    },
-    "vel": 0.25,
-    "acc": 0.25
+  "task": "move-ee",
+  "mode": "ptp",
+  "pose": {
+    "pos": [0.0, 0.0, 90.0],
+    "quat": [0.0, 0.7071, 0.7071, 0.0]
   }
+},
+{
+  "task": "move-ee",
+  "mode": "ptp",
+  "pose": {
+    "pos": [20.50, 0.0, 500.25],
+    "quat": [0.0, 0.7071, 0.7071, 0.0]
+  }
+},
+{
+  "task": "move-ee",
+  "mode": "ptp",
+  "pose": {
+    "pos": [30.60, 0.0, 500.25],
+    "quat": [0.0, 0.7071, 0.7071, 0.0]
+  }
+},
+{
+  "task": "move-ee",
+  "mode": "ptp",
+  "pose": {
+    "pos": [0.0, 0.0, 900.0],
+    "quat": [0.0, 0.7071, 0.7071, 0.0]
+  }
+}
 ]
