@@ -24,7 +24,6 @@ import rclpy
 from dsr_msgs2.srv import GetCurrentPosj, Ikin, MoveJoint, MoveJointx
 
 # =========================== USER SETTINGS ============================
-ROBOT_MODE = "virtual"  # Test virtual first; change to "real" only when safe.
 ROBOT_ID = "dsr01"
 INSTRUCTION_FILE = Path("/home/bbrug1/ROS2V2_ws/src/mijn_eerste_pkg/test/Human.json")
 ENABLE_MOTION = True
@@ -42,14 +41,10 @@ DOOSAN_PTP_MAX_ACCELERATION_DEG_S2 = 180.0
 # Fill only after experimentally validating the native Doosan solution-space
 # number (0..7) for this model. An omitted config selects the closest solution.
 CANONICAL_CONFIG_TO_DOOSAN_SOL = {
-    # ("SL", "EU", "WN"): 0,
-    # ("SL", "EU", "WF"): 1,
-    # ("SL", "ED", "WN"): 2,
-    # ("SL", "ED", "WF"): 3,
-    # ("SR", "EU", "WN"): 4,
-    # ("SR", "EU", "WF"): 5,
-    # ("SR", "ED", "WN"): 6,
-    # ("SR", "ED", "WF"): 7,
+    CANONICAL_CONFIG_TO_DOOSAN_SOL = {
+    ("SL","ED","WN"):0, ("SL","ED","WF"):1, ("SL","EU","WN"):2, ("SL","EU","WF"):3,
+    ("SR","ED","WN"):4, ("SR","ED","WF"):5, ("SR","EU","WN"):6, ("SR","EU","WF"):7,
+}
 }
 
 SERVICE_TIMEOUT = 10.0
@@ -317,8 +312,19 @@ def resolve_move_ee_plan(node, position_client, ik_client, plan):
             current = payload[0]
         elif task == "move-ee-ptp":
             pose, requested_sol, velocity, acceleration = payload
+            print(json.dumps({
+                "event": "move_ee_preflight",
+                "line": line,
+                "doosan_pose_mm_zyz_deg": pose,
+                "requested_sol": requested_sol,
+            })) # kan uiteindelijk verwijderd worden
             candidates = [(sol, ik_solution(node, ik_client, pose, sol)) for sol in range(8)]
             valid = [(sol, joints) for sol, joints in candidates if joints is not None]
+            print(json.dumps({
+                "event": "ik_candidates",
+                "line": line,
+                "valid_solutions": [sol for sol, _ in valid],
+            }))
             if not valid:
                 raise InterpreterError(line, "E_UNREACHABLE", "Target pose has no IK solution.")
             if requested_sol is None:
