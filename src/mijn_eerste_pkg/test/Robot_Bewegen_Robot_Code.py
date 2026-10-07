@@ -341,7 +341,7 @@ def ptp_timeout(start, target, velocity):
     return max(MOTION_TIMEOUT_MINIMUM, max_delta / speed + MOTION_TIMEOUT_MARGIN)
 
 
-def execute_plan(node, position_client, move_client, move_jointx_client, plan):
+def execute_plan(node, position_client, ik_client, move_client, move_jointx_client, plan):
     current = current_joints(node, position_client)
     for line, task, payload in plan:
         try:
@@ -371,7 +371,7 @@ def execute_plan(node, position_client, move_client, move_jointx_client, plan):
                     request.time, request.radius, request.ref, request.mode = 0.0, 0.0, 0, 0
                     request.blend_type, request.sync_type = 0, 0
                     call_service(node, move_jointx_client, request, "the MoveJointx command", MOTION_TIMEOUT_MINIMUM + 60.0)
-                current = ik_solution(node, node.create_client(Ikin, IKIN_SERVICE), pose, sol) or current
+                current = ik_solution(node, ik_client, pose, sol) or current
                 emit(line, "ok")
         except RuntimeError as error:
             emit(line, "error", "E_DEVICE", str(error))
@@ -399,7 +399,7 @@ def main():
                 wait_for_service(move_jointx_client, MOVE_JOINTX_SERVICE)
         if ENABLE_MOTION and any(task == "ptp" for _, task, _ in plan):
             wait_for_service(move_client, MOVE_JOINT_SERVICE)
-        return execute_plan(node, position_client, move_client, move_jointx_client, plan)
+        return execute_plan(node,position_client,ik_client,move_client, move_jointx_client, plan,)
     except InterpreterError as error:
         emit(error.line, "error", error.code, error.message)
         return 1
