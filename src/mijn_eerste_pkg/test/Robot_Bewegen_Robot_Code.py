@@ -41,10 +41,10 @@ DOOSAN_PTP_MAX_ACCELERATION_DEG_S2 = 180.0
 # Fill only after experimentally validating the native Doosan solution-space
 # number (0..7) for this model. An omitted config selects the closest solution.
 CANONICAL_CONFIG_TO_DOOSAN_SOL = {
-    CANONICAL_CONFIG_TO_DOOSAN_SOL = {
+    
     ("SL","ED","WN"):0, ("SL","ED","WF"):1, ("SL","EU","WN"):2, ("SL","EU","WF"):3,
     ("SR","ED","WN"):4, ("SR","ED","WF"):5, ("SR","EU","WN"):6, ("SR","EU","WF"):7,
-}
+
 }
 
 SERVICE_TIMEOUT = 10.0
