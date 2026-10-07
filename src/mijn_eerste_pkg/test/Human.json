@@ -1,110 +1,75 @@
 [
-  {"task": "set", "param": "max-velocity", "value": 0.05},
-  {"task": "set", "param": "max-acceleration", "value": 0.05},
-  {"task": "set", "param": "velocity", "value": 0.03},
-  {"task": "set", "param": "acceleration", "value": 0.03},
+  {"task": "set", "param": "max-velocity", "value": 0.5},
+  {"task": "set", "param": "max-acceleration", "value": 1.0},
+  {"task": "set", "param": "velocity", "value": 0.05},
+  {"task": "set", "param": "acceleration", "value": 0.1},
 
   {"task": "wait", "value": 2.0},
-  {"task": "move_joint", "value": [0, 0, 90, 0, 90, 0]},
+
+  {"task": "move_joint", "value": [0, 0, -90, 0, 90, 0], "vel": 0.1, "acc": 0.1},
   {"task": "wait", "value": 1.0},
 
   {
     "task": "move-ee",
     "mode": "ptp",
     "pose": {
-      "pos": [0.40, 0.00, 0.40],
+      "pos": [-0.40, 0.00, 0.40],
       "quat": [0.0, 0.7071, 0.7071, 0.0]
-    }
+    },
+    "vel": 0.1,
+    "acc": 0.1
   },
   {"task": "wait", "value": 1.5},
 
   {
     "task": "move-ee",
-    "mode": "ptp",
+    "mode": "lin",
     "pose": {
-      "pos": [0.40, 0.00, 0.40],
+      "pos": [-0.40, 0.00, 0.30],
       "quat": [0.0, 0.7071, 0.7071, 0.0]
     },
-    "config": {"shoulder": "SL", "elbow": "ED", "wrist": "WN"}
+    "vel": 0.03,
+    "acc": 0.1
   },
   {"task": "wait", "value": 1.5},
 
   {
     "task": "move-ee",
-    "mode": "ptp",
+    "mode": "lin",
     "pose": {
-      "pos": [0.40, 0.00, 0.40],
+      "pos": [-0.40, 0.10, 0.30],
       "quat": [0.0, 0.7071, 0.7071, 0.0]
     },
-    "config": {"shoulder": "SL", "elbow": "ED", "wrist": "WF"}
+    "vel": 0.03,
+    "acc": 0.1
   },
   {"task": "wait", "value": 1.5},
 
   {
     "task": "move-ee",
-    "mode": "ptp",
+    "mode": "lin",
     "pose": {
-      "pos": [0.40, 0.00, 0.40],
-      "quat": [0.0, 0.7071, 0.7071, 0.0]
+      "pos": [-0.40, 0.10, 0.30],
+      "quat": [0.0, 0.9238795, 0.3826834, 0.0]
     },
-    "config": {"shoulder": "SL", "elbow": "EU", "wrist": "WN"}
+    "vel": 0.03,
+    "acc": 0.1
   },
   {"task": "wait", "value": 1.5},
 
   {
     "task": "move-ee",
-    "mode": "ptp",
+    "mode": "lin",
     "pose": {
-      "pos": [0.40, 0.00, 0.40],
+      "pos": [-0.40, 0.00, 0.40],
       "quat": [0.0, 0.7071, 0.7071, 0.0]
     },
-    "config": {"shoulder": "SL", "elbow": "EU", "wrist": "WF"}
+    "vel": 0.03,
+    "acc": 0.1
   },
   {"task": "wait", "value": 1.5},
 
-  {
-    "task": "move-ee",
-    "mode": "ptp",
-    "pose": {
-      "pos": [0.40, 0.00, 0.40],
-      "quat": [0.0, 0.7071, 0.7071, 0.0]
-    },
-    "config": {"shoulder": "SR", "elbow": "ED", "wrist": "WN"}
-  },
-  {"task": "wait", "value": 1.5},
-
-  {
-    "task": "move-ee",
-    "mode": "ptp",
-    "pose": {
-      "pos": [0.40, 0.00, 0.40],
-      "quat": [0.0, 0.7071, 0.7071, 0.0]
-    },
-    "config": {"shoulder": "SR", "elbow": "ED", "wrist": "WF"}
-  },
-  {"task": "wait", "value": 1.5},
-
-  {
-    "task": "move-ee",
-    "mode": "ptp",
-    "pose": {
-      "pos": [0.40, 0.00, 0.40],
-      "quat": [0.0, 0.7071, 0.7071, 0.0]
-    },
-    "config": {"shoulder": "SR", "elbow": "EU", "wrist": "WN"}
-  },
-  {"task": "wait", "value": 1.5},
-
-  {
-    "task": "move-ee",
-    "mode": "ptp",
-    "pose": {
-      "pos": [0.40, 0.00, 0.40],
-      "quat": [0.0, 0.7071, 0.7071, 0.0]
-    },
-    "config": {"shoulder": "SR", "elbow": "EU", "wrist": "WF"}
-  },
-  {"task": "wait", "value": 1.5},
-
+  {"task": "set", "param": "velocity", "value": 0.1},
+  {"task": "set", "param": "acceleration", "value": 0.1},
   {"task": "move_joint", "value": [0, 0, 0, 0, 0, 0]}
 ]

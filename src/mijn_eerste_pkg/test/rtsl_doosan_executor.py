@@ -60,7 +60,7 @@ except ImportError:
 ROBOT_ID = "dsr01"
 INSTRUCTION_FILE = Path("/home/bbrug1/ROS2V2_ws/src/mijn_eerste_pkg/test/Human.json")
 
-ENABLE_MOTION = False
+ENABLE_MOTION = True
 
 ROBOT_MODEL = "a0509"
 CONTROLLER_VERSION = "DRCF GF02100100 / DRFL GL013304"
