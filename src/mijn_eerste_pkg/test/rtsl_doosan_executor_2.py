@@ -893,8 +893,11 @@ def execute_plan(node, position_client, ik_client, fk_client, move_client,
     return 0
 
 
+import os
+
 def main():
-    self_test()
+    if os.environ.get("RTSL_SELF_TEST") == "1":
+        self_test()
     rclpy.init()
     node = rclpy.create_node("rtsl_doosan_executor")
     try:
