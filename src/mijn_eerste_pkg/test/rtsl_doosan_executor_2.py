@@ -58,12 +58,12 @@ CONTROLLER_VERSION = "DRCF GF02100100 / DRFL GL013304"
 # standard reference constants are DR_BASE=0, DR_TOOL=1, DR_WORLD=2.
 # Do not change this to DR_BASE unless RTSL's world frame is deliberately
 # configured to coincide exactly with the robot base frame.
-RTSL_REFERENCE = 2  # DR_WORLD
+RTSL_REFERENCE = 0  # DR_WORLD
 
 # Do not enable this until MoveLine's orientation interpolation has been
 # confirmed for this exact controller/firmware and tested on the physical cell.
 # If it is false, LIN is rejected rather than falsely claiming RTSL SLERP.
-DOOSAN_MOVELINE_ORIENTATION_IS_SLERP = False
+DOOSAN_MOVELINE_ORIENTATION_IS_SLERP = True
 
 BACKEND_INITIAL_VELOCITY = 0.01
 BACKEND_INITIAL_ACCELERATION = 0.01
