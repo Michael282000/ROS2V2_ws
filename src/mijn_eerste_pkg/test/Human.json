@@ -3,12 +3,9 @@
   {"task": "set", "param": "max-acceleration", "value": 1.0},
   {"task": "set", "param": "velocity", "value": 0.05},
   {"task": "set", "param": "acceleration", "value": 0.1},
-
   {"task": "wait", "value": 2.0},
-
   {"task": "move_joint", "value": [1.73, -17.24, 103.47, -7.97, 3.37, 0], "vel": 0.1, "acc": 0.1},
   {"task": "wait", "value": 1.0},
-
   {
     "task": "move-ee",
     "mode": "ptp",
@@ -20,7 +17,6 @@
     "acc": 0.1
   },
   {"task": "wait", "value": 1.5},
-
   {
     "task": "move-ee",
     "mode": "lin",
@@ -43,17 +39,16 @@
     "acc": 0.1
   },
   {"task": "move_joint", "value": [181.73, -17.24, 103.47, -7.97, 93.37, 0], "vel": 0.1, "acc": 0.1},
-
-
-
-
-
-
-
-
-
- 
-
+  {
+    "task": "move-ee",
+    "mode": "lin",
+    "pose": {
+      "pos": [-0.263, 0.016, 0.114],
+      "quat": [0.0693, -0.9975281, -0.0107331, 0.0045292]
+    },
+    "vel": 0.03,
+    "acc": 0.1
+  },
   {"task": "set", "param": "velocity", "value": 0.1},
   {"task": "set", "param": "acceleration", "value": 0.1},
   {"task": "move_joint", "value": [0, 0, 0, 0, 0, 0]}
