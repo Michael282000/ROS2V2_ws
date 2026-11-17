@@ -1,43 +1,18 @@
 #!/usr/bin/env python3
-"""RTSL v0.1 interpreter for a Doosan arm on ROS 2 (dsr_controller2).
+"""RTSL v0.1 JSON-array executor for a Doosan arm on ROS 2 (dsr_controller2).
 
-v2 adds `move-ee mode=lin`:
-  - straight Cartesian line, SLERP on orientation
-  - branch constancy enforced by preflight sampling (Ikin+Fkin per sample
-    with a fixed sol, joint-jump check between consecutive samples)
-  - vel/acc are TCP translational m/s and m/s^2 (RTSL spec); rotational
-    components use configurable defaults because RTSL v0.1 does not expose
-    them separately.
+Cartesian targets use Doosan DR_WORLD (2). Cartesian execution is refused until
+an independently surveyed cell-world/base transform and intended TCP have been
+configured and verified. At startup and immediately before each Cartesian line,
+compare Doosan FK in BASE and WORLD against that survey, compare measured WORLD
+TCP pose against WORLD FK, and check the active TCP name. No frame is inferred
+from IK/FK round-tripping alone. These checks do not replace physical setup
+verification, particularly for temporary motion TCP overrides.
 
-Supported JSON tasks:
-  {"task":"set", "param":"velocity", "value":0.5}
-  {"task":"ptp"|"move_joint", "value":[0,-30,60,0,60,0], "vel":0.5}
-  {"task":"move-ee", "mode":"ptp",
-   "pose":{"pos":[0.40,-0.10,0.25], "quat":[0.0,0.7071,0.7071,0.0]},
-   "config":{"shoulder":"SR","elbow":"EU","wrist":"WN"}, "vel":0.25}
-  {"task":"move-ee", "mode":"lin",
-   "pose":{"pos":[0.40,-0.10,0.25], "quat":[0.0,0.7071,0.7071,0.0]},
-   "config":{"shoulder":"SR","elbow":"EU","wrist":"WN"}, "vel":0.05}
-  {"task":"wait", "value":2}
+RTSL positions: metres; quaternion: w,x,y,z. Doosan posx: mm and ZYZ degrees.
 
-UNITS AND CONVENTIONS
----------------------
-RTSL v0.1 (General rules): poses are in metres and the orientation is a unit
-quaternion in (w, x, y, z) order, Hamilton convention, world -> TCP. Doosan
-posx is [mm, mm, mm, deg, deg, deg] with ZYZ Euler angles.
+DOESNT WORK RIGHT NOW!
 
-PTP vel/acc are fractions 0..1 of the back-end's PTP maxima.
-LIN vel/acc are TCP translational m/s and m/s^2. See the KNOWN FOOTGUN note
-in the modal-value warning: the same `set velocity 0.5` is interpreted
-differently per mode. This is RTSL v0.1 as written; v0.2 should split them.
-
-VALIDATION OF IK RESULTS (unchanged from v1)
---------------------------------------------
-Ikin returns only `success`. Guards: Fkin round-trip and joint-limit check.
-
-SOLUTION SPACE (unchanged, validated 40/40 on a0509)
-----------------------------------------------------
-    sol = 4*S + 2*E + W      S: SL=0 SR=1 | E: ED=0 EU=1 | W: WN=0 WF=1
 """
 
 import json
@@ -47,7 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import rclpy
-from dsr_msgs2.srv import GetCurrentPosj, Ikin, MoveJoint, MoveJointx, MoveLine
+from dsr_msgs2.srv import (GetCurrentPosj, GetCurrentPosx, GetCurrentTcp,
+                           GetCurrentToolFlangePosx, Ikin, MoveJoint, MoveLine)
 
 try:
     from dsr_msgs2.srv import Fkin
@@ -59,57 +35,69 @@ except ImportError:
 # =========================== USER SETTINGS ============================
 ROBOT_ID = "dsr01"
 INSTRUCTION_FILE = Path("/home/bbrug1/ROS2V2_ws/src/mijn_eerste_pkg/test/Human.json")
-
 ENABLE_MOTION = True
-
 ROBOT_MODEL = "a0509"
 CONTROLLER_VERSION = "DRCF GF02100100 / DRFL GL013304"
+
+# Doosan DR_BASE=0, DR_TOOL=1, DR_WORLD=2. The installed controller MUST
+# support ref=2 for IK, FK and MoveLine. Never substitute DR_BASE silently.
+RTSL_REFERENCE = 2
+
+# FAIL CLOSED: these are cell-specific, not knowable from this program.
+# Survey the pose of the robot BASE origin in the RTSL cell WORLD frame
+# independently (mm, quaternion wxyz), and verify the configured controller
+# WORLD frame coincides with that cell frame. Do not derive these values from
+# the same FK outputs checked below: that would be a circular test.
+WORLD_FROM_BASE_POS_MM = [0.0, 0.0, 0.0]               # e.g. [x_mm, y_mm, z_mm]
+WORLD_FROM_BASE_QUAT_WXYZ = [1.0, 0.0, 0.0, 0.0]           # e.g. [w, x, y, z]
+EXPECTED_TCP_NAME = ""                    # controller TCP name; "" if flange
+# Independently measured TCP relative to flange, Doosan ZYZ posx [mm, deg].
+# Compare against controller-measured TCP/flange poses; name alone is insufficient.
+EXPECTED_FLANGE_TO_TCP_POSX = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+CELL_WORLD_AND_TCP_VERIFIED = True           # set True only after cell check
+
+# Survey and live-state agreement. Choose tolerances for survey accuracy.
+WORLD_CHECK_POSITION_TOL_MM = 2.0
+WORLD_CHECK_ORIENTATION_TOL_DEG = 1.0
+# Compare GetCurrentPosx(WORLD) to Fkin(WORLD) on the measured joints.
+CURRENT_TCP_CHECK_POSITION_TOL_MM = 3.0
+CURRENT_TCP_CHECK_ORIENTATION_TOL_DEG = 2.0
+
+# Only enable after checking interpolation on the installed controller/cell.
+DOOSAN_MOVELINE_ORIENTATION_IS_SLERP = True
 
 BACKEND_INITIAL_VELOCITY = 0.01
 BACKEND_INITIAL_ACCELERATION = 0.01
 BACKEND_INITIAL_MAX_VELOCITY = 1.0
 BACKEND_INITIAL_MAX_ACCELERATION = 1.0
-
-# PTP backend maxima (fraction 1.0 -> this value). VERIFY on your controller.
 DOOSAN_PTP_MAX_VELOCITY_DEG_S = 150.0
 DOOSAN_PTP_MAX_ACCELERATION_DEG_S2 = 150.0
-
-# LIN caps in RTSL SI units. VERIFY against your cell safety envelope.
-# a0509 datasheet TCP speed ~1 m/s; this is a conservative cell default.
 BACKEND_LIN_MAX_VELOCITY_M_S = 0.25
 BACKEND_LIN_MAX_ACCELERATION_M_S2 = 1.0
-
-# Rotational companions for MoveLine. RTSL v0.1 has no separate field, so
-# these are a back-end policy. Keep them modest; raise only after visual
-# verification on the real cell.
 LIN_DEFAULT_ROT_VEL_DEG_S = 30.0
 LIN_DEFAULT_ROT_ACC_DEG_S2 = 60.0
 
-# LIN preflight (branch-constancy sampling).
-LIN_SAMPLES = 20                 # inclusive of start and end
-LIN_MAX_JOINT_JUMP_DEG = 15.0    # per-joint drempel between adjacent samples
-LIN_MIN_POS_FOR_TRANSLATION_MM = 0.1   # below this we treat as pure rotation
+LIN_MIN_SEGMENTS = 20
+LIN_MAX_SAMPLE_TRANSLATION_MM = 5.0
+LIN_MAX_SAMPLE_ROTATION_DEG = 2.0
+LIN_MAX_JOINT_JUMP_DEG = 15.0
+LIN_BRANCH_MATCH_TOL_DEG = 2.0
+LIN_MIN_POS_FOR_TRANSLATION_MM = 0.1
+PTP_END_MATCH_TOL_DEG = 2.0
 
 JOINT_LIMITS_DEG = [
-    (-360.0, 360.0),
-    (-360.0, 360.0),
-    (-160.0, 160.0),
-    (-360.0, 360.0),
-    (-360.0, 360.0),
-    (-360.0, 360.0),
+    (-360.0, 360.0), (-360.0, 360.0), (-160.0, 160.0),
+    (-360.0, 360.0), (-360.0, 360.0), (-360.0, 360.0),
 ]
-
 CANONICAL_CONFIG_TO_DOOSAN_SOL = {
     ("SL", "ED", "WN"): 0, ("SL", "ED", "WF"): 1,
     ("SL", "EU", "WN"): 2, ("SL", "EU", "WF"): 3,
     ("SR", "ED", "WN"): 4, ("SR", "ED", "WF"): 5,
     ("SR", "EU", "WN"): 6, ("SR", "EU", "WF"): 7,
 }
-
 FKIN_POSITION_TOL_MM = 0.5
 FKIN_ORIENTATION_TOL_DEG = 0.5
 LARGE_MOTION_WARN_DEG = 180.0
-
 SERVICE_TIMEOUT = 10.0
 POSITION_RESPONSE_TIMEOUT = 10.0
 IK_RESPONSE_TIMEOUT = 10.0
@@ -119,10 +107,12 @@ MOTION_TIMEOUT_MINIMUM = 30.0
 
 CONTROLLER_NAMESPACE = f"/{ROBOT_ID}/dsr_controller2"
 POSITION_SERVICE = f"{CONTROLLER_NAMESPACE}/aux_control/get_current_posj"
+CURRENT_POSX_SERVICE = f"{CONTROLLER_NAMESPACE}/aux_control/get_current_posx"
+FLANGE_POSX_SERVICE = f"{CONTROLLER_NAMESPACE}/aux_control/get_current_tool_flange_posx"
+CURRENT_TCP_SERVICE = f"{CONTROLLER_NAMESPACE}/tcp/get_current_tcp"
 IKIN_SERVICE = f"{CONTROLLER_NAMESPACE}/motion/ikin"
 FKIN_SERVICE = f"{CONTROLLER_NAMESPACE}/motion/fkin"
 MOVE_JOINT_SERVICE = f"{CONTROLLER_NAMESPACE}/motion/move_joint"
-MOVE_JOINTX_SERVICE = f"{CONTROLLER_NAMESPACE}/motion/move_jointx"
 MOVE_LINE_SERVICE = f"{CONTROLLER_NAMESPACE}/motion/move_line"
 
 
@@ -137,7 +127,9 @@ class ModalValues:
 class InterpreterError(Exception):
     def __init__(self, line, code, message):
         super().__init__(message)
-        self.line, self.code, self.message = line, code, message
+        self.line = line
+        self.code = code
+        self.message = message
 
 
 def emit(line, status, code=None, payload=None):
@@ -150,7 +142,7 @@ def note(event, **fields):
 
 
 # --------------------------------------------------------------------- #
-# scalar parsing (unchanged)
+# Scalar parsing and modal values
 # --------------------------------------------------------------------- #
 def _as_float(value, line, field):
     if isinstance(value, bool):
@@ -185,8 +177,17 @@ def initial_modal_values():
         finite_positive(BACKEND_INITIAL_MAX_VELOCITY, 0, "BACKEND_INITIAL_MAX_VELOCITY"),
         finite_positive(BACKEND_INITIAL_MAX_ACCELERATION, 0, "BACKEND_INITIAL_MAX_ACCELERATION"),
     )
+    for name, value in (
+        ("DOOSAN_PTP_MAX_VELOCITY_DEG_S", DOOSAN_PTP_MAX_VELOCITY_DEG_S),
+        ("DOOSAN_PTP_MAX_ACCELERATION_DEG_S2", DOOSAN_PTP_MAX_ACCELERATION_DEG_S2),
+        ("BACKEND_LIN_MAX_VELOCITY_M_S", BACKEND_LIN_MAX_VELOCITY_M_S),
+        ("BACKEND_LIN_MAX_ACCELERATION_M_S2", BACKEND_LIN_MAX_ACCELERATION_M_S2),
+        ("LIN_DEFAULT_ROT_VEL_DEG_S", LIN_DEFAULT_ROT_VEL_DEG_S),
+        ("LIN_DEFAULT_ROT_ACC_DEG_S2", LIN_DEFAULT_ROT_ACC_DEG_S2),
+    ):
+        finite_positive(value, 0, name)
     if values.velocity > values.max_velocity or values.acceleration > values.max_acceleration:
-        raise ValueError("Initial velocity/acceleration cannot exceed their configured caps.")
+        raise ValueError("Initial velocity/acceleration cannot exceed configured caps.")
     return values
 
 
@@ -194,6 +195,8 @@ def report_initial_values(values):
     note("initial_modal_values",
          robot_model=ROBOT_MODEL,
          controller_version=CONTROLLER_VERSION,
+         rtsl_reference=RTSL_REFERENCE,
+         world_and_tcp_verified=CELL_WORLD_AND_TCP_VERIFIED,
          velocity=values.velocity,
          acceleration=values.acceleration,
          max_velocity=values.max_velocity,
@@ -204,13 +207,14 @@ def report_initial_values(values):
          lin_backend_max_acceleration_m_s2=BACKEND_LIN_MAX_ACCELERATION_M_S2,
          lin_default_rot_vel_deg_s=LIN_DEFAULT_ROT_VEL_DEG_S,
          lin_default_rot_acc_deg_s2=LIN_DEFAULT_ROT_ACC_DEG_S2,
+         moveline_orientation_slerp_verified=DOOSAN_MOVELINE_ORIENTATION_IS_SLERP,
          quaternion_order="wxyz",
          fkin_validation=HAVE_FKIN,
          motion_enabled=ENABLE_MOTION)
     if not HAVE_FKIN:
-        note("warning", detail="Fkin unavailable: IK solutions are checked against "
-                               "joint limits only, not against the requested pose. "
-                               "LIN preflight cannot run reliably.")
+        note("warning", detail="Fkin unavailable: Cartesian motion cannot execute.")
+    if not DOOSAN_MOVELINE_ORIENTATION_IS_SLERP:
+        note("warning", detail="LIN disabled until MoveLine SLERP equivalence is verified.")
 
 
 def motion_value(instruction, line, short_name, long_name, default):
@@ -224,20 +228,17 @@ def motion_value(instruction, line, short_name, long_name, default):
 def validate_ptp(line, velocity, acceleration, modal):
     if velocity > 1.0 or velocity > modal.max_velocity:
         raise InterpreterError(line, "E_LIMIT",
-                               "PTP velocity exceeds its cap or the portable range 0-1.")
+                               "PTP velocity exceeds its cap or portable range 0-1.")
     if acceleration > 1.0 or acceleration > modal.max_acceleration:
         raise InterpreterError(line, "E_LIMIT",
-                               "PTP acceleration exceeds its cap or the portable range 0-1.")
+                               "PTP acceleration exceeds its cap or portable range 0-1.")
 
 
 def validate_lin(line, velocity, acceleration, modal):
-    """RTSL v0.1: LIN vel/acc are TCP translational m/s and m/s^2."""
     if velocity > modal.max_velocity:
-        raise InterpreterError(line, "E_LIMIT",
-                               "LIN velocity exceeds the modal max-velocity.")
+        raise InterpreterError(line, "E_LIMIT", "LIN velocity exceeds modal max-velocity.")
     if acceleration > modal.max_acceleration:
-        raise InterpreterError(line, "E_LIMIT",
-                               "LIN acceleration exceeds the modal max-acceleration.")
+        raise InterpreterError(line, "E_LIMIT", "LIN acceleration exceeds modal max-acceleration.")
     if velocity > BACKEND_LIN_MAX_VELOCITY_M_S:
         raise InterpreterError(line, "E_LIMIT",
                                f"LIN velocity {velocity} m/s exceeds back-end cap "
@@ -249,20 +250,27 @@ def validate_lin(line, velocity, acceleration, modal):
 
 
 def warn_modal_ambiguity(line, param, value):
-    """RTSL v0.1 does not separate ptp (fraction) and lin (m/s) modals.
-    Shout about it on every change so the author cannot miss it."""
-    if param not in {"velocity", "acceleration", "max-velocity", "max-acceleration"}:
-        return
     kind = "velocity" if "velocity" in param else "acceleration"
-    ptp_unit = "fraction 0..1"
-    lin_unit_v = "m/s"
-    lin_unit_a = "m/s^2"
-    note("warning_modal_ambiguity",
-         line=line, param=param, value=value,
-         detail=f"RTSL v0.1 has one modal '{kind}' shared by ptp ({ptp_unit}) "
-                f"and lin ({lin_unit_v if kind == 'velocity' else lin_unit_a}). "
-                f"The same number means different things in each mode. "
-                f"Prefer explicit per-line vel()/acc() overrides.")
+    lin_unit = "m/s" if kind == "velocity" else "m/s^2"
+    note("warning_modal_ambiguity", line=line, param=param, value=value,
+         detail=f"RTSL v0.1 has one modal '{kind}' shared by ptp (fraction 0..1) "
+                f"and lin ({lin_unit}). Prefer explicit per-line vel/acc overrides.")
+
+
+# --------------------------------------------------------------------- #
+# Joint and configuration helpers
+# --------------------------------------------------------------------- #
+def joint_delta_deg(a, b):
+    """Shortest equivalent angular difference a-b, in [-180, 180)."""
+    return (a - b + 180.0) % 360.0 - 180.0
+
+
+def angular_distance(a, b):
+    return sum(joint_delta_deg(x, y) ** 2 for x, y in zip(a, b))
+
+
+def max_joint_jump_deg(a, b):
+    return max(abs(joint_delta_deg(x, y)) for x, y in zip(a, b))
 
 
 def joint_limit_violations(joints):
@@ -282,7 +290,7 @@ def parse_joints(value, line):
     violations = joint_limit_violations(joints)
     if violations:
         raise InterpreterError(line, "E_LIMIT",
-                               f"Joint angles outside the configured limits: {violations}")
+                               f"Joint angles outside configured limits: {violations}")
     return joints
 
 
@@ -294,18 +302,15 @@ def parse_config(value, line):
     if (config[0] not in {"SL", "SR"} or config[1] not in {"EU", "ED"}
             or config[2] not in {"WN", "WF"}):
         raise InterpreterError(line, "E_PARSE", "Invalid canonical IK configuration.")
-    if config not in CANONICAL_CONFIG_TO_DOOSAN_SOL:
+    sol = CANONICAL_CONFIG_TO_DOOSAN_SOL.get(config)
+    if sol is None:
         raise InterpreterError(line, "E_UNSUPPORTED",
-                               "No experimentally validated Doosan sol mapping for this config.")
-    sol = CANONICAL_CONFIG_TO_DOOSAN_SOL[config]
-    if isinstance(sol, bool) or not isinstance(sol, int) or not 0 <= sol <= 7:
-        raise InterpreterError(line, "E_UNSUPPORTED",
-                               "Configured Doosan solution-space mapping must be an integer 0-7.")
+                               "No validated Doosan sol mapping for this config.")
     return config, sol
 
 
 # --------------------------------------------------------------------- #
-# orientation + quaternion math (SLERP added)
+# Orientation and pose conversion
 # --------------------------------------------------------------------- #
 def quaternion_to_matrix(w, x, y, z):
     return (
@@ -346,8 +351,7 @@ def rotation_angle_deg(ra, rb):
 
 def quaternion_normalise(quat, line):
     if not isinstance(quat, list) or len(quat) != 4:
-        raise InterpreterError(line, "E_PARSE",
-                               "quat must be [w, x, y, z] (RTSL v0.1 order).")
+        raise InterpreterError(line, "E_PARSE", "quat must be [w, x, y, z].")
     w, x, y, z = (_as_float(v, line, "quat") for v in quat)
     norm = math.sqrt(w * w + x * x + y * y + z * z)
     if abs(norm - 1.0) > 1e-3:
@@ -356,110 +360,85 @@ def quaternion_normalise(quat, line):
     return [w / norm, x / norm, y / norm, z / norm]
 
 
-def quaternion_to_zyz_degrees(quat, line):
-    w, x, y, z = quaternion_normalise(quat, line)
-    return matrix_to_zyz_degrees(quaternion_to_matrix(w, x, y, z))
-
-
 def matrix_to_quaternion(r):
-    """Return (w, x, y, z). Shepperd's method, numerically stable."""
+    """Return normalised (w, x, y, z), using Shepperd's stable method."""
     trace = r[0][0] + r[1][1] + r[2][2]
     if trace > 0:
         s = math.sqrt(trace + 1.0) * 2
-        w = 0.25 * s
-        x = (r[2][1] - r[1][2]) / s
-        y = (r[0][2] - r[2][0]) / s
-        z = (r[1][0] - r[0][1]) / s
+        w, x, y, z = (0.25 * s, (r[2][1] - r[1][2]) / s,
+                      (r[0][2] - r[2][0]) / s, (r[1][0] - r[0][1]) / s)
     elif r[0][0] > r[1][1] and r[0][0] > r[2][2]:
         s = math.sqrt(1.0 + r[0][0] - r[1][1] - r[2][2]) * 2
-        w = (r[2][1] - r[1][2]) / s
-        x = 0.25 * s
-        y = (r[0][1] + r[1][0]) / s
-        z = (r[0][2] + r[2][0]) / s
+        w, x, y, z = ((r[2][1] - r[1][2]) / s, 0.25 * s,
+                      (r[0][1] + r[1][0]) / s, (r[0][2] + r[2][0]) / s)
     elif r[1][1] > r[2][2]:
         s = math.sqrt(1.0 + r[1][1] - r[0][0] - r[2][2]) * 2
-        w = (r[0][2] - r[2][0]) / s
-        x = (r[0][1] + r[1][0]) / s
-        y = 0.25 * s
-        z = (r[1][2] + r[2][1]) / s
+        w, x, y, z = ((r[0][2] - r[2][0]) / s, (r[0][1] + r[1][0]) / s,
+                      0.25 * s, (r[1][2] + r[2][1]) / s)
     else:
         s = math.sqrt(1.0 + r[2][2] - r[0][0] - r[1][1]) * 2
-        w = (r[1][0] - r[0][1]) / s
-        x = (r[0][2] + r[2][0]) / s
-        y = (r[1][2] + r[2][1]) / s
-        z = 0.25 * s
-    return [w, x, y, z]
+        w, x, y, z = ((r[1][0] - r[0][1]) / s, (r[0][2] + r[2][0]) / s,
+                      (r[1][2] + r[2][1]) / s, 0.25 * s)
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    return [w / norm, x / norm, y / norm, z / norm]
 
 
 def quaternion_slerp(q0, q1, t):
-    """SLERP between unit quaternions (w,x,y,z). t in [0,1]."""
+    """Shortest-arc SLERP between unit wxyz quaternions."""
     dot = sum(a * b for a, b in zip(q0, q1))
-    if dot < 0.0:          # take the shorter arc
+    if dot < 0.0:
         q1 = [-v for v in q1]
         dot = -dot
-    if dot > 0.9995:       # nearly parallel: linear + renormalise
+    if dot > 0.9995:
         out = [a + t * (b - a) for a, b in zip(q0, q1)]
-        n = math.sqrt(sum(v * v for v in out))
-        return [v / n for v in out]
+        norm = math.sqrt(sum(v * v for v in out))
+        return [v / norm for v in out]
     theta_0 = math.acos(max(-1.0, min(1.0, dot)))
     theta = theta_0 * t
-    sin_theta_0 = math.sin(theta_0)
-    s0 = math.sin(theta_0 - theta) / sin_theta_0
-    s1 = math.sin(theta) / sin_theta_0
+    s0 = math.sin(theta_0 - theta) / math.sin(theta_0)
+    s1 = math.sin(theta) / math.sin(theta_0)
     return [s0 * a + s1 * b for a, b in zip(q0, q1)]
 
 
 def parse_pose(value, line):
-    """RTSL pose (metres + wxyz quat) -> Doosan posx [mm, mm, mm, deg, deg, deg]."""
+    """RTSL pose -> (position_mm, unit quaternion wxyz)."""
     if not isinstance(value, dict) or set(value) != {"pos", "quat"}:
         raise InterpreterError(line, "E_PARSE", "pose needs pos and quat fields.")
-    pos = value["pos"]
-    if not isinstance(pos, list) or len(pos) != 3:
+    if not isinstance(value["pos"], list) or len(value["pos"]) != 3:
         raise InterpreterError(line, "E_PARSE", "pose.pos must be [x, y, z] in metres.")
-    xyz = [_as_float(c, line, "pose.pos") for c in pos]
-    return [c * 1000.0 for c in xyz] + quaternion_to_zyz_degrees(value["quat"], line)
+    position_mm = [_as_float(c, line, "pose.pos") * 1000.0 for c in value["pos"]]
+    return position_mm, quaternion_normalise(value["quat"], line)
 
 
-def parse_pose_wxyz(value, line):
-    """Same as parse_pose but keeps the quaternion as (w,x,y,z) for SLERP."""
-    if not isinstance(value, dict) or set(value) != {"pos", "quat"}:
-        raise InterpreterError(line, "E_PARSE", "pose needs pos and quat fields.")
-    pos = value["pos"]
-    if not isinstance(pos, list) or len(pos) != 3:
-        raise InterpreterError(line, "E_PARSE", "pose.pos must be [x, y, z] in metres.")
-    xyz_mm = [_as_float(c, line, "pose.pos") * 1000.0 for c in pos]
-    quat = quaternion_normalise(value["quat"], line)
-    return xyz_mm, quat
+def posx_from_pose(position_mm, quat_wxyz):
+    return list(position_mm) + matrix_to_zyz_degrees(quaternion_to_matrix(*quat_wxyz))
 
 
 def self_test():
     r = quaternion_to_matrix(0.0, 1.0, 0.0, 0.0)
     assert abs(r[0][0] - 1.0) < 1e-12 and abs(r[2][2] + 1.0) < 1e-12, r
-    quat = [0.0, 0.7071067811865476, 0.7071067811865476, 0.0]
-    zyz = quaternion_to_zyz_degrees(quat, 0)
-    assert rotation_angle_deg(quaternion_to_matrix(*quat),
-                              zyz_degrees_to_matrix(*zyz)) < 1e-6, zyz
-    assert sorted(CANONICAL_CONFIG_TO_DOOSAN_SOL.values()) == list(range(8))
-    # SLERP sanity: midpoint of 0 and 180 deg about x is 90 deg about x.
-    q0 = [1.0, 0.0, 0.0, 0.0]
-    q1 = [0.0, 1.0, 0.0, 0.0]
-    qh = quaternion_slerp(q0, q1, 0.5)
-    expected = [math.cos(math.radians(45.0)), math.sin(math.radians(45.0)), 0.0, 0.0]
+    q = [0.0, 0.7071067811865476, 0.7071067811865476, 0.0]
+    zyz = matrix_to_zyz_degrees(quaternion_to_matrix(*q))
+    assert rotation_angle_deg(quaternion_to_matrix(*q), zyz_degrees_to_matrix(*zyz)) < 1e-6
+    qh = quaternion_slerp([1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], 0.5)
+    expected = [math.cos(math.radians(45)), math.sin(math.radians(45)), 0.0, 0.0]
     assert max(abs(a - b) for a, b in zip(qh, expected)) < 1e-9, qh
+    assert abs(joint_delta_deg(-179.0, 181.0)) < 1e-9
+    assert sorted(CANONICAL_CONFIG_TO_DOOSAN_SOL.values()) == list(range(8))
 
 
 # --------------------------------------------------------------------- #
-# program parsing
+# Program parsing: no hardware calls and no IK resolution occur here.
 # --------------------------------------------------------------------- #
 def parse_program(instructions, initial):
     if not isinstance(instructions, list):
-        raise InterpreterError(0, "E_PARSE", "The JSON root must be a list of instructions.")
+        raise InterpreterError(0, "E_PARSE", "JSON root must be a list of instructions.")
     modal = ModalValues(**vars(initial))
     plan = []
     for line, instruction in enumerate(instructions, start=1):
         if not isinstance(instruction, dict) or not isinstance(instruction.get("task"), str):
             raise InterpreterError(line, "E_PARSE",
-                                   "Each instruction must be an object with a string task.")
+                                   "Each instruction needs an object with string task.")
         task = instruction["task"]
         if task == "set":
             if set(instruction) != {"task", "param", "value"} or instruction["param"] not in {
@@ -475,18 +454,17 @@ def parse_program(instructions, initial):
                 modal.velocity = value
             elif param == "acceleration":
                 if value > modal.max_acceleration:
-                    raise InterpreterError(line, "E_LIMIT",
-                                           "acceleration exceeds max-acceleration.")
+                    raise InterpreterError(line, "E_LIMIT", "acceleration exceeds max-acceleration.")
                 modal.acceleration = value
             elif param == "max-velocity":
                 if value < modal.velocity:
                     raise InterpreterError(line, "E_LIMIT",
-                                           "max-velocity cannot be below the active velocity.")
+                                           "max-velocity cannot be below active velocity.")
                 modal.max_velocity = value
             else:
                 if value < modal.acceleration:
                     raise InterpreterError(line, "E_LIMIT",
-                                           "max-acceleration cannot be below the active acceleration.")
+                                           "max-acceleration cannot be below active acceleration.")
                 modal.max_acceleration = value
             plan.append((line, "set", {"param": param, "value": value}))
         elif task in {"ptp", "move_joint"}:
@@ -496,43 +474,40 @@ def parse_program(instructions, initial):
             velocity = motion_value(instruction, line, "vel", "velocity", modal.velocity)
             acceleration = motion_value(instruction, line, "acc", "acceleration", modal.acceleration)
             validate_ptp(line, velocity, acceleration, modal)
-            plan.append((line, "ptp",
-                         (parse_joints(instruction["value"], line), velocity, acceleration)))
+            plan.append((line, "ptp", (parse_joints(instruction["value"], line),
+                                       velocity, acceleration)))
         elif task == "move-ee":
             allowed = {"task", "mode", "pose", "config", "vel", "velocity", "acc", "acceleration"}
-            if (not set(instruction) <= allowed
-                    or instruction.get("mode") not in {"ptp", "lin"}
+            if (not set(instruction) <= allowed or instruction.get("mode") not in {"ptp", "lin"}
                     or "pose" not in instruction):
                 raise InterpreterError(line, "E_PARSE", "Invalid move-ee instruction.")
             mode = instruction["mode"]
             velocity = motion_value(instruction, line, "vel", "velocity", modal.velocity)
             acceleration = motion_value(instruction, line, "acc", "acceleration", modal.acceleration)
-            sol = parse_config(instruction["config"], line)[1] if "config" in instruction else None
+            requested_sol = parse_config(instruction["config"], line)[1] if "config" in instruction else None
+            position_mm, quat_wxyz = parse_pose(instruction["pose"], line)
             if mode == "ptp":
                 validate_ptp(line, velocity, acceleration, modal)
                 plan.append((line, "move-ee-ptp",
-                             (parse_pose(instruction["pose"], line), sol,
-                              velocity, acceleration)))
+                             (position_mm, quat_wxyz, requested_sol, velocity, acceleration)))
             else:
                 validate_lin(line, velocity, acceleration, modal)
-                pose_mm, quat_wxyz = parse_pose_wxyz(instruction["pose"], line)
                 plan.append((line, "move-ee-lin",
-                             (pose_mm, quat_wxyz, sol, velocity, acceleration)))
+                             (position_mm, quat_wxyz, requested_sol, velocity, acceleration)))
         elif task == "wait":
             if set(instruction) != {"task", "value"}:
                 raise InterpreterError(line, "E_PARSE", "Invalid wait instruction.")
             plan.append((line, "wait", finite_nonnegative(instruction["value"], line, "value")))
         elif task in {"take-image", "gripper"}:
             raise InterpreterError(line, "E_UNSUPPORTED",
-                                   f"This back-end targets a bare robot controller: "
-                                   f"{task} is not available.")
+                                   f"This bare robot-controller back-end has no {task} support.")
         else:
             raise InterpreterError(line, "E_UNSUPPORTED", f"Unsupported task: {task}.")
     return plan
 
 
 # --------------------------------------------------------------------- #
-# ROS plumbing (unchanged)
+# ROS service plumbing
 # --------------------------------------------------------------------- #
 def wait_for_service(client, service_name, required=True):
     print(f"Waiting for service: {service_name}", flush=True)
@@ -552,7 +527,7 @@ def call_service(node, client, request, description, timeout):
         raise RuntimeError(f"Timed out while waiting for {description}.")
     response = future.result()
     if response is None or not getattr(response, "success", False):
-        raise RuntimeError(f"The controller rejected or failed {description}.")
+        raise RuntimeError(f"Controller rejected or failed {description}.")
     return response
 
 
@@ -571,30 +546,33 @@ def try_call(node, client, request, timeout):
 def current_joints(node, position_client):
     response = call_service(node, position_client, GetCurrentPosj.Request(),
                             "the current joint-position response", POSITION_RESPONSE_TIMEOUT)
-    return [float(angle) for angle in response.pos]
+    joints = [float(angle) for angle in response.pos]
+    if len(joints) != 6:
+        raise RuntimeError(f"Controller returned {len(joints)} joints; expected six.")
+    return joints
 
 
 def raw_ik(node, ik_client, pose, sol):
     request = Ikin.Request()
     request.pos = [float(v) for v in pose]
     request.sol_space = int(sol)
-    request.ref = 0
+    request.ref = RTSL_REFERENCE
     response = try_call(node, ik_client, request, IK_RESPONSE_TIMEOUT)
     if response is None:
         return None
-    return [float(angle) for angle in response.conv_posj]
+    joints = [float(angle) for angle in response.conv_posj]
+    return joints if len(joints) == 6 else None
 
 
-def raw_fk(node, fk_client, joints):
-    if fk_client is None:
-        return None
+def raw_fk(node, fk_client, joints, ref=RTSL_REFERENCE):
     request = Fkin.Request()
     request.pos = [float(angle) for angle in joints]
-    request.ref = 0
+    request.ref = ref
     response = try_call(node, fk_client, request, IK_RESPONSE_TIMEOUT)
     if response is None:
         return None
-    return [float(v) for v in response.conv_posx]
+    pose = [float(v) for v in response.conv_posx]
+    return pose if len(pose) == 6 and all(map(math.isfinite, pose)) else None
 
 
 def ik_solution(node, ik_client, fk_client, pose, sol):
@@ -604,271 +582,404 @@ def ik_solution(node, ik_client, fk_client, pose, sol):
     violations = joint_limit_violations(joints)
     if violations:
         return None, f"joint limits violated: {violations}"
-    if fk_client is not None:
-        posx = raw_fk(node, fk_client, joints)
-        if posx is None:
-            return None, "fkin round-trip failed"
-        dp = math.sqrt(sum((a - b) ** 2 for a, b in zip(posx[:3], pose[:3])))
-        drot = rotation_angle_deg(zyz_degrees_to_matrix(*posx[3:]),
-                                  zyz_degrees_to_matrix(*pose[3:]))
-        if dp > FKIN_POSITION_TOL_MM or drot > FKIN_ORIENTATION_TOL_DEG:
-            return None, f"fkin round-trip off by {dp:.3f} mm / {drot:.3f} deg"
+    posx = raw_fk(node, fk_client, joints)
+    note("ik_fk_probe", sol=sol, ik_joints=joints, fk_world=posx, fk_base=raw_fk(node, fk_client, joints, ref=0), target_world=pose)
+    if posx is None:
+        return None, "fkin round-trip failed"
+    dp = math.sqrt(sum((a - b) ** 2 for a, b in zip(posx[:3], pose[:3])))
+    drot = rotation_angle_deg(zyz_degrees_to_matrix(*posx[3:]),
+                              zyz_degrees_to_matrix(*pose[3:]))
+    if dp > FKIN_POSITION_TOL_MM or drot > FKIN_ORIENTATION_TOL_DEG:
+        return None, f"fkin round-trip off by {dp:.3f} mm / {drot:.3f} deg"
     return joints, None
 
 
-def angular_distance(a, b):
-    return sum((x - y) ** 2 for x, y in zip(a, b))
+# --------------------------------------------------------------------- #
+# External world-frame and TCP verification (no motion)
+# --------------------------------------------------------------------- #
+def frame_survey():
+    """Validate externally measured configuration; never infer it from FK."""
+    if RTSL_REFERENCE != 2:
+        raise InterpreterError(0, "E_UNSUPPORTED", "RTSL requires DR_WORLD (ref=2).")
+    if (not CELL_WORLD_AND_TCP_VERIFIED or WORLD_FROM_BASE_POS_MM is None
+            or WORLD_FROM_BASE_QUAT_WXYZ is None or EXPECTED_TCP_NAME is None
+            or EXPECTED_FLANGE_TO_TCP_POSX is None):
+        raise InterpreterError(0, "E_UNSUPPORTED",
+                               "Cartesian motion requires surveyed WORLD_FROM_BASE_POS_MM, "
+                               "WORLD_FROM_BASE_QUAT_WXYZ, EXPECTED_TCP_NAME, "
+                               "EXPECTED_FLANGE_TO_TCP_POSX and verified cell configuration; "
+                               "no motion was sent.")
+    if (not isinstance(WORLD_FROM_BASE_POS_MM, (list, tuple))
+            or len(WORLD_FROM_BASE_POS_MM) != 3
+            or not isinstance(EXPECTED_TCP_NAME, str)
+            or not isinstance(EXPECTED_FLANGE_TO_TCP_POSX, (list, tuple))):
+        raise InterpreterError(0, "E_UNSUPPORTED", "Invalid world survey or TCP name.")
+    try:
+        p = [float(v) for v in WORLD_FROM_BASE_POS_MM]
+        q = [float(v) for v in WORLD_FROM_BASE_QUAT_WXYZ]
+    except (TypeError, ValueError):
+        raise InterpreterError(0, "E_UNSUPPORTED", "Invalid world survey values.")
+    if (len(q) != 4 or not all(map(math.isfinite, p + q))
+            or abs(math.sqrt(sum(v * v for v in q)) - 1.0) > 1e-3):
+        raise InterpreterError(0, "E_UNSUPPORTED", "World survey quaternion must be unit wxyz.")
+    try:
+        tcp = [float(v) for v in EXPECTED_FLANGE_TO_TCP_POSX]
+    except (TypeError, ValueError):
+        raise InterpreterError(0, "E_UNSUPPORTED", "Invalid surveyed flange-to-TCP pose.")
+    if len(tcp) != 6 or not all(map(math.isfinite, tcp)):
+        raise InterpreterError(0, "E_UNSUPPORTED", "Expected flange-to-TCP pose must be six finite values.")
+    norm = math.sqrt(sum(v * v for v in q))
+    return p, quaternion_to_matrix(*(v / norm for v in q)), tcp
+
+
+def multiply_rotations(a, b):
+    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(3))
+                       for j in range(3)) for i in range(3))
+
+
+def pose_difference(a, b):
+    dp = math.sqrt(sum((x - y) ** 2 for x, y in zip(a[:3], b[:3])))
+    dr = rotation_angle_deg(zyz_degrees_to_matrix(*a[3:]),
+                            zyz_degrees_to_matrix(*b[3:]))
+    return dp, dr
+
+
+def assert_cartesian_setup(node, position_client, fk_client, tcp_client,
+                           current_posx_client, flange_posx_client, line, joints=None):
+    """Fail before motion if surveyed WORLD, reported TCP or current pose disagrees."""
+    p_world_base, r_world_base, flange_to_tcp = frame_survey()
+    tcp_response = call_service(node, tcp_client, GetCurrentTcp.Request(),
+                                "active TCP-name check", POSITION_RESPONSE_TIMEOUT)
+    if tcp_response.info != EXPECTED_TCP_NAME:
+        raise InterpreterError(line, "E_DEVICE",
+                               f"Active TCP {tcp_response.info!r} is not expected "
+                               f"{EXPECTED_TCP_NAME!r}; no Cartesian command was sent.")
+    if joints is None:
+        joints = current_joints(node, position_client)
+    base_pose = raw_fk(node, fk_client, joints, ref=0)
+    world_pose = raw_fk(node, fk_client, joints, ref=RTSL_REFERENCE)
+    if base_pose is None or world_pose is None:
+        raise InterpreterError(line, "E_DEVICE",
+                               "FK in BASE or WORLD failed; controller may not support ref=2.")
+    r_base_tcp = zyz_degrees_to_matrix(*base_pose[3:])
+    expected_rotation = multiply_rotations(r_world_base, r_base_tcp)
+    expected_position = [p_world_base[i] + sum(r_world_base[i][j] * base_pose[j]
+                                                 for j in range(3)) for i in range(3)]
+    dp = math.sqrt(sum((a - b) ** 2 for a, b in zip(expected_position, world_pose[:3])))
+    dr = rotation_angle_deg(expected_rotation, zyz_degrees_to_matrix(*world_pose[3:]))
+    if dp > WORLD_CHECK_POSITION_TOL_MM or dr > WORLD_CHECK_ORIENTATION_TOL_DEG:
+        raise InterpreterError(line, "E_DEVICE",
+                               f"Controller WORLD differs from surveyed cell WORLD by "
+                               f"{dp:.2f} mm / {dr:.2f} deg; no Cartesian command was sent.")
+    current_request = GetCurrentPosx.Request()
+    current_request.ref = RTSL_REFERENCE
+    current_response = call_service(node, current_posx_client, current_request,
+                                    "current WORLD TCP-pose check", POSITION_RESPONSE_TIMEOUT)
+    try:
+        measured = [float(v) for v in current_response.task_pos_info[0].data[:6]]
+    except (IndexError, AttributeError, TypeError, ValueError):
+        raise InterpreterError(line, "E_DEVICE", "Invalid WORLD TCP pose response.")
+    if len(measured) != 6 or not all(map(math.isfinite, measured)):
+        raise InterpreterError(line, "E_DEVICE", "Invalid WORLD TCP pose response.")
+    live_dp, live_dr = pose_difference(measured, world_pose)
+    if (live_dp > CURRENT_TCP_CHECK_POSITION_TOL_MM
+            or live_dr > CURRENT_TCP_CHECK_ORIENTATION_TOL_DEG):
+        raise InterpreterError(line, "E_DEVICE",
+                               f"Measured WORLD TCP and WORLD FK disagree by "
+                               f"{live_dp:.2f} mm / {live_dr:.2f} deg; check active TCP.")
+    flange_request = GetCurrentToolFlangePosx.Request()
+    flange_request.ref = RTSL_REFERENCE
+    flange_response = call_service(node, flange_posx_client, flange_request,
+                                   "current WORLD flange-pose check", POSITION_RESPONSE_TIMEOUT)
+    try:
+        flange = [float(v) for v in flange_response.pos]
+    except (AttributeError, TypeError, ValueError):
+        raise InterpreterError(line, "E_DEVICE", "Invalid WORLD flange pose response.")
+    if len(flange) != 6 or not all(map(math.isfinite, flange)):
+        raise InterpreterError(line, "E_DEVICE", "Invalid WORLD flange pose response.")
+    r_world_flange = zyz_degrees_to_matrix(*flange[3:])
+    r_flange_tcp = zyz_degrees_to_matrix(*flange_to_tcp[3:])
+    expected_tcp_rotation = multiply_rotations(r_world_flange, r_flange_tcp)
+    expected_tcp_position = [flange[i] + sum(r_world_flange[i][j] * flange_to_tcp[j]
+                                               for j in range(3)) for i in range(3)]
+    tcp_dp = math.sqrt(sum((a - b) ** 2 for a, b in zip(expected_tcp_position, measured[:3])))
+    tcp_dr = rotation_angle_deg(expected_tcp_rotation, zyz_degrees_to_matrix(*measured[3:]))
+    if (tcp_dp > CURRENT_TCP_CHECK_POSITION_TOL_MM
+            or tcp_dr > CURRENT_TCP_CHECK_ORIENTATION_TOL_DEG):
+        raise InterpreterError(line, "E_DEVICE",
+                               f"Active motion TCP differs from surveyed flange-to-TCP pose "
+                               f"by {tcp_dp:.2f} mm / {tcp_dr:.2f} deg; no motion was sent.")
+    note("cartesian_setup_ok", line=line, ref=RTSL_REFERENCE,
+         tcp=tcp_response.info, survey_error_mm=round(dp, 3),
+         survey_error_deg=round(dr, 3), tcp_fk_error_mm=round(live_dp, 3),
+         tcp_fk_error_deg=round(live_dr, 3),
+         surveyed_tcp_error_mm=round(tcp_dp, 3), surveyed_tcp_error_deg=round(tcp_dr, 3))
 
 
 # --------------------------------------------------------------------- #
-# LIN preflight
+# IK resolution and LIN branch preflight
 # --------------------------------------------------------------------- #
+def select_ptp_solution(node, ik_client, fk_client, current, target_posx, requested_sol, line):
+    candidates, rejected = {}, {}
+    for sol in range(8):
+        joints, reason = ik_solution(node, ik_client, fk_client, target_posx, sol)
+        if joints is None:
+            rejected[sol] = reason
+        else:
+            candidates[sol] = joints
+    note("ik_candidates", line=line,
+         doosan_pose_mm_zyz_deg=[round(v, 4) for v in target_posx],
+         requested_sol=requested_sol, valid_solutions=sorted(candidates), rejected=rejected)
+    if not candidates:
+        raise InterpreterError(line, "E_UNREACHABLE", "Target pose has no valid IK solution.")
+    if requested_sol is None:
+        sol = min(candidates, key=lambda candidate: angular_distance(current, candidates[candidate]))
+    elif requested_sol in candidates:
+        sol = requested_sol
+    else:
+        raise InterpreterError(line, "E_UNREACHABLE_CONFIG",
+                               f"Requested IK branch sol={requested_sol} is invalid at target "
+                               f"({rejected.get(requested_sol, 'unknown reason')}).")
+    return sol, candidates[sol]
+
+
 def interpolate_posx(start_pos_mm, start_quat, end_pos_mm, end_quat, t):
-    """Linear on position (mm), SLERP on orientation. Returns Doosan posx."""
     pos = [a + t * (b - a) for a, b in zip(start_pos_mm, end_pos_mm)]
     quat = quaternion_slerp(start_quat, end_quat, t)
-    zyz = matrix_to_zyz_degrees(quaternion_to_matrix(*quat))
-    return pos + zyz
+    return posx_from_pose(pos, quat)
 
 
-def determine_start_sol(node, ik_client, fk_client, start_joints):
-    """Infer which sol reproduces the current joint configuration."""
-    start_posx = raw_fk(node, fk_client, start_joints)
-    if start_posx is None:
-        return None, start_posx, "fkin on current joints failed"
-    best_sol, best_err = None, float("inf")
+def determine_start_sol(node, ik_client, fk_client, start_joints, start_posx):
+    best_sol, best_joints, best_error = None, None, float("inf")
     for sol in range(8):
         joints, reason = ik_solution(node, ik_client, fk_client, start_posx, sol)
         if joints is None:
             continue
-        err = angular_distance(joints, start_joints)
-        if err < best_err:
-            best_err, best_sol = err, sol
+        error = angular_distance(joints, start_joints)
+        if error < best_error:
+            best_sol, best_joints, best_error = sol, joints, error
     if best_sol is None:
-        return None, start_posx, "no sol reproduces the current pose"
-    return best_sol, start_posx, None
+        return None, "no valid sol reproduces current pose"
+    mismatch = max_joint_jump_deg(best_joints, start_joints)
+    if mismatch > LIN_BRANCH_MATCH_TOL_DEG:
+        return None, (f"closest sol={best_sol} differs from measured joints by "
+                      f"{mismatch:.2f} deg")
+    return best_sol, None
 
 
-def preflight_lin(node, ik_client, fk_client,
-                  start_joints, start_posx, start_quat,
-                  end_pos_mm, end_quat, sol, line):
-    """Sample the straight-line path and verify branch constancy.
-    Returns (joints_at_end, samples_meta) or raises InterpreterError."""
-    if fk_client is None:
-        raise InterpreterError(line, "E_UNSUPPORTED",
-                               "LIN preflight requires Fkin; this build lacks it.")
+def assert_start_branch(node, ik_client, fk_client, start_joints, start_posx, sol, line):
+    branch_joints, reason = ik_solution(node, ik_client, fk_client, start_posx, sol)
+    if branch_joints is None:
+        raise InterpreterError(line, "E_CONFIG_CHANGE",
+                               f"LIN start pose is not valid on asserted sol={sol}: {reason}.")
+    mismatch = max_joint_jump_deg(branch_joints, start_joints)
+    if mismatch > LIN_BRANCH_MATCH_TOL_DEG:
+        raise InterpreterError(line, "E_CONFIG_CHANGE",
+                               f"LIN starts on a different branch than asserted sol={sol}; "
+                               f"joint difference is {mismatch:.2f} deg.")
 
-    start_pos_mm = start_posx[:3]
+
+def lin_segment_count(start_pos_mm, start_quat, end_pos_mm, end_quat):
     distance_mm = math.sqrt(sum((a - b) ** 2 for a, b in zip(start_pos_mm, end_pos_mm)))
-    rot_deg = rotation_angle_deg(quaternion_to_matrix(*start_quat),
-                                 quaternion_to_matrix(*end_quat))
+    rotation_deg = rotation_angle_deg(quaternion_to_matrix(*start_quat),
+                                      quaternion_to_matrix(*end_quat))
+    by_translation = math.ceil(distance_mm / LIN_MAX_SAMPLE_TRANSLATION_MM)
+    by_rotation = math.ceil(rotation_deg / LIN_MAX_SAMPLE_ROTATION_DEG)
+    return max(LIN_MIN_SEGMENTS, by_translation, by_rotation), distance_mm, rotation_deg
 
+
+def preflight_lin(node, ik_client, fk_client, start_joints, start_posx, start_quat,
+                  end_pos_mm, end_quat, sol, line):
+    segments, distance_mm, rotation_deg = lin_segment_count(
+        start_posx[:3], start_quat, end_pos_mm, end_quat)
     previous_joints = start_joints
-    samples_meta = []
-    for i in range(1, LIN_SAMPLES + 1):      # skip i=0 (start) which is current
-        t = i / LIN_SAMPLES
-        sample_pose = interpolate_posx(start_pos_mm, start_quat,
-                                       end_pos_mm, end_quat, t)
+    maximum_jump = 0.0
+    for index in range(1, segments + 1):
+        t = index / segments
+        sample_pose = interpolate_posx(start_posx[:3], start_quat, end_pos_mm, end_quat, t)
         joints, reason = ik_solution(node, ik_client, fk_client, sample_pose, sol)
         if joints is None:
             raise InterpreterError(
                 line, "E_CONFIG_CHANGE",
-                f"LIN preflight: sample {i}/{LIN_SAMPLES} (t={t:.3f}) rejected "
-                f"on sol={sol}: {reason}. The requested branch does not cover "
-                f"the full straight-line path.")
-        jump = max(abs(a - b) for a, b in zip(joints, previous_joints))
+                f"LIN preflight sample {index}/{segments} (t={t:.4f}) rejected on "
+                f"sol={sol}: {reason}. The asserted branch does not cover the path.")
+        jump = max_joint_jump_deg(joints, previous_joints)
         if jump > LIN_MAX_JOINT_JUMP_DEG:
             raise InterpreterError(
                 line, "E_CONFIG_CHANGE",
-                f"LIN preflight: joint-jump {jump:.2f} deg between samples "
-                f"{i-1} and {i} exceeds drempel {LIN_MAX_JOINT_JUMP_DEG} deg. "
-                f"Likely a branch switch or near-singularity on sol={sol}.")
-        samples_meta.append({"t": round(t, 3), "jump_deg": round(jump, 3)})
+                f"LIN preflight joint jump {jump:.2f} deg between samples {index - 1} "
+                f"and {index} exceeds {LIN_MAX_JOINT_JUMP_DEG} deg on sol={sol}.")
+        maximum_jump = max(maximum_jump, jump)
         previous_joints = joints
-
     note("lin_preflight_ok", line=line, sol=sol,
-         distance_mm=round(distance_mm, 3),
-         rotation_deg=round(rot_deg, 3),
-         samples=LIN_SAMPLES,
-         max_jump_deg=round(max(s["jump_deg"] for s in samples_meta), 3))
-    return previous_joints
+         distance_mm=round(distance_mm, 3), rotation_deg=round(rotation_deg, 3),
+         segments=segments, max_jump_deg=round(maximum_jump, 3))
+    return previous_joints, distance_mm, rotation_deg, segments
 
 
 # --------------------------------------------------------------------- #
-# plan resolution
-# --------------------------------------------------------------------- #
-def resolve_move_ee_plan(node, position_client, ik_client, fk_client, plan):
-    current = current_joints(node, position_client)
-    note("preflight_start", current_posj=[round(a, 4) for a in current])
-    resolved = []
-    for line, task, payload in plan:
-        if task == "ptp":
-            current = payload[0]
-            resolved.append((line, task, payload))
-            continue
-        if task == "move-ee-ptp":
-            pose, requested_sol, velocity, acceleration = payload
-            candidates, rejected = {}, {}
-            for sol in range(8):
-                joints, reason = ik_solution(node, ik_client, fk_client, pose, sol)
-                if joints is None:
-                    rejected[sol] = reason
-                else:
-                    candidates[sol] = joints
-
-            note("ik_candidates", line=line,
-                 doosan_pose_mm_zyz_deg=[round(v, 4) for v in pose],
-                 requested_sol=requested_sol,
-                 valid_solutions=sorted(candidates),
-                 rejected=rejected)
-
-            if not candidates:
-                raise InterpreterError(line, "E_UNREACHABLE",
-                                       "Target pose has no valid IK solution.")
-
-            if requested_sol is None:
-                sol = min(candidates, key=lambda s: angular_distance(current, candidates[s]))
-            elif requested_sol in candidates:
-                sol = requested_sol
-            else:
-                raise InterpreterError(
-                    line, "E_UNREACHABLE_CONFIG",
-                    f"Requested IK branch sol={requested_sol} is not valid at the target "
-                    f"({rejected.get(requested_sol, 'unknown reason')}).")
-
-            joints = candidates[sol]
-            travel = max(abs(a - b) for a, b in zip(current, joints))
-            if travel > LARGE_MOTION_WARN_DEG:
-                note("warning", line=line, max_joint_travel_deg=round(travel, 2),
-                     detail="large joint travel; SL/SR branches coincide in Cartesian "
-                            "space on arms without shoulder offset.")
-
-            resolved.append((line, task, (pose, sol, velocity, acceleration, joints)))
-            current = joints
-            continue
-
-        if task == "move-ee-lin":
-            end_pos_mm, end_quat, requested_sol, velocity, acceleration = payload
-            # Determine start pose + branch
-            start_posx = raw_fk(node, fk_client, current) if fk_client else None
-            if start_posx is None:
-                raise InterpreterError(line, "E_UNSUPPORTED",
-                                       "LIN requires Fkin to establish the start pose.")
-            start_quat = matrix_to_quaternion(zyz_degrees_to_matrix(*start_posx[3:]))
-
-            if requested_sol is None:
-                sol, _, reason = determine_start_sol(node, ik_client, fk_client, current)
-                if sol is None:
-                    raise InterpreterError(line, "E_UNREACHABLE_CONFIG",
-                                           f"Cannot infer start sol: {reason}.")
-                note("lin_sol_asserted_from_start", line=line, sol=sol)
-            else:
-                sol = requested_sol
-
-            # Reject pure-rotation runs with no translational motion only to
-            # warn; keep executing (SLERP + rotational default handle it).
-            distance_mm = math.sqrt(sum((a - b) ** 2
-                                        for a, b in zip(start_posx[:3], end_pos_mm)))
-            if distance_mm < LIN_MIN_POS_FOR_TRANSLATION_MM:
-                note("warning", line=line,
-                     detail=f"LIN pure rotation (distance {distance_mm:.3f} mm). "
-                            f"Translational vel ignored; rotational default used.")
-
-            end_joints = preflight_lin(node, ik_client, fk_client,
-                                       current, start_posx, start_quat,
-                                       end_pos_mm, end_quat, sol, line)
-
-            # End pose as Doosan posx (what MoveLine expects)
-            end_posx = (list(end_pos_mm)
-                        + matrix_to_zyz_degrees(quaternion_to_matrix(*end_quat)))
-            resolved.append((line, task, (end_posx, sol, velocity, acceleration,
-                                          end_joints, distance_mm)))
-            current = end_joints
-            continue
-
-        resolved.append((line, task, payload))
-    return resolved
-
-
-# --------------------------------------------------------------------- #
-# execution
+# Motion execution
 # --------------------------------------------------------------------- #
 def ptp_timeout(start, target, velocity):
-    max_delta = max(abs(a - b) for a, b in zip(start, target))
+    max_delta = max_joint_jump_deg(start, target)
     speed = max(velocity * DOOSAN_PTP_MAX_VELOCITY_DEG_S, 1e-6)
     return max(MOTION_TIMEOUT_MINIMUM, max_delta / speed + MOTION_TIMEOUT_MARGIN)
 
 
-def lin_timeout(distance_mm, velocity_m_s):
-    speed_mm_s = max(velocity_m_s * 1000.0, 1e-6)
-    return max(MOTION_TIMEOUT_MINIMUM, distance_mm / speed_mm_s + MOTION_TIMEOUT_MARGIN)
+def lin_timeout(distance_mm, rotation_deg, velocity_m_s):
+    translation_time = distance_mm / max(velocity_m_s * 1000.0, 1e-6)
+    rotation_time = rotation_deg / max(LIN_DEFAULT_ROT_VEL_DEG_S, 1e-6)
+    return max(MOTION_TIMEOUT_MINIMUM,
+               max(translation_time, rotation_time) + MOTION_TIMEOUT_MARGIN)
 
 
-def execute_plan(node, position_client, move_client, move_jointx_client,
-                 move_line_client, plan):
-    current = current_joints(node, position_client)
+def issue_move_joint(node, move_client, target, velocity, acceleration, timeout):
+    request = MoveJoint.Request()
+    request.pos = [float(v) for v in target]
+    request.vel = float(velocity * DOOSAN_PTP_MAX_VELOCITY_DEG_S)
+    request.acc = float(acceleration * DOOSAN_PTP_MAX_ACCELERATION_DEG_S2)
+    request.time = 0.0
+    request.radius = 0.0
+    request.mode = 0
+    request.blend_type = 0
+    request.sync_type = 0
+    call_service(node, move_client, request, "the MoveJoint command", timeout)
+
+
+def issue_move_line(node, move_line_client, end_posx, velocity, acceleration,
+                    distance_mm, rotation_deg):
+    request = MoveLine.Request()
+    request.pos = [float(v) for v in end_posx]
+    request.vel = [float(velocity * 1000.0), float(LIN_DEFAULT_ROT_VEL_DEG_S)]
+    request.acc = [float(acceleration * 1000.0), float(LIN_DEFAULT_ROT_ACC_DEG_S2)]
+    request.time = 0.0
+    request.radius = 0.0
+    request.ref = RTSL_REFERENCE
+    request.mode = 0
+    request.blend_type = 0
+    request.sync_type = 0
+    call_service(node, move_line_client, request, "the MoveLine command",
+                 lin_timeout(distance_mm, rotation_deg, velocity))
+
+
+def execute_plan(node, position_client, current_posx_client, flange_posx_client,
+                 tcp_client, ik_client, fk_client, move_client, move_line_client, plan):
     for line, task, payload in plan:
         try:
             if task == "set":
                 emit(line, "ok", payload=payload)
-            elif task == "wait":
+                continue
+            if task == "wait":
                 time.sleep(payload)
                 emit(line, "ok")
-            elif task == "ptp":
+                continue
+            if task == "ptp":
                 target, velocity, acceleration = payload
+                current = current_joints(node, position_client)
                 if ENABLE_MOTION:
-                    request = MoveJoint.Request()
-                    request.pos = target
-                    request.vel = velocity * DOOSAN_PTP_MAX_VELOCITY_DEG_S
-                    request.acc = acceleration * DOOSAN_PTP_MAX_ACCELERATION_DEG_S2
-                    request.time, request.radius, request.mode = 0.0, 0.0, 0
-                    request.blend_type, request.sync_type = 0, 0
-                    call_service(node, move_client, request, "the MoveJoint command",
-                                 ptp_timeout(current, target, velocity))
-                current = target
+                    issue_move_joint(node, move_client, target, velocity, acceleration,
+                                     ptp_timeout(current, target, velocity))
+                    actual = current_joints(node, position_client)
+                    mismatch = max_joint_jump_deg(actual, target)
+                    if mismatch > PTP_END_MATCH_TOL_DEG:
+                        raise InterpreterError(line, "E_DEVICE",
+                                               f"PTP ended {mismatch:.2f} deg from commanded joint target.")
                 emit(line, "ok", payload={"posj": [round(a, 4) for a in target],
                                           "motion": ENABLE_MOTION})
-            elif task == "move-ee-ptp":
-                pose, sol, velocity, acceleration, joints = payload
+                continue
+            if task == "move-ee-ptp":
+                position_mm, quat_wxyz, requested_sol, velocity, acceleration = payload
+                current = current_joints(node, position_client)
+                assert_cartesian_setup(node, position_client, fk_client, tcp_client,
+                                       current_posx_client, flange_posx_client, line, current)
+                target_posx = posx_from_pose(position_mm, quat_wxyz)
+                sol, joints = select_ptp_solution(node, ik_client, fk_client, current,
+                                                  target_posx, requested_sol, line)
+                travel = max_joint_jump_deg(current, joints)
+                if travel > LARGE_MOTION_WARN_DEG:
+                    note("warning", line=line, max_joint_travel_deg=round(travel, 2),
+                         detail="large joint travel to selected IK solution")
                 if ENABLE_MOTION:
-                    request = MoveJointx.Request()
-                    request.pos = [float(v) for v in pose]
-                    request.sol = int(sol)
-                    request.vel = velocity * DOOSAN_PTP_MAX_VELOCITY_DEG_S
-                    request.acc = acceleration * DOOSAN_PTP_MAX_ACCELERATION_DEG_S2
-                    request.time, request.radius = 0.0, 0.0
-                    request.ref, request.mode = 0, 0
-                    request.blend_type, request.sync_type = 0, 0
-                    call_service(node, move_jointx_client, request,
-                                 "the MoveJointx command",
-                                 ptp_timeout(current, joints, velocity))
-                current = joints
+                    # IK calls can take time; refuse if world/TCP or start joints changed.
+                    now = current_joints(node, position_client)
+                    assert_cartesian_setup(node, position_client, fk_client, tcp_client,
+                                           current_posx_client, flange_posx_client, line, now)
+                    if max_joint_jump_deg(now, current) > LIN_BRANCH_MATCH_TOL_DEG:
+                        raise InterpreterError(line, "E_DEVICE",
+                                               "Start joints changed during Cartesian PTP IK.")
+                    issue_move_joint(node, move_client, joints, velocity, acceleration,
+                                     ptp_timeout(now, joints, velocity))
+                    actual = current_joints(node, position_client)
+                    mismatch = max_joint_jump_deg(actual, joints)
+                    if mismatch > PTP_END_MATCH_TOL_DEG:
+                        raise InterpreterError(line, "E_DEVICE",
+                                               f"move-ee ptp ended {mismatch:.2f} deg from validated sol={sol}.")
                 emit(line, "ok", payload={"sol": sol, "mode": "ptp",
+                                          "posx_mm_zyz_deg": [round(v, 4) for v in target_posx],
                                           "posj": [round(a, 4) for a in joints],
                                           "motion": ENABLE_MOTION})
-            elif task == "move-ee-lin":
-                end_posx, sol, velocity, acceleration, end_joints, distance_mm = payload
+                continue
+            if task == "move-ee-lin":
+                if not DOOSAN_MOVELINE_ORIENTATION_IS_SLERP:
+                    raise InterpreterError(
+                        line, "E_UNSUPPORTED",
+                        "LIN requires verified SLERP-equivalent MoveLine orientation "
+                        "interpolation; enable only after controller/cell verification.")
+                end_pos_mm, end_quat, requested_sol, velocity, acceleration = payload
+                start_joints = current_joints(node, position_client)
+                assert_cartesian_setup(node, position_client, fk_client, tcp_client,
+                                       current_posx_client, flange_posx_client, line, start_joints)
+                start_posx = raw_fk(node, fk_client, start_joints)
+                if start_posx is None:
+                    raise InterpreterError(line, "E_DEVICE",
+                                           "Fkin failed on current joints before LIN motion.")
+                start_quat = matrix_to_quaternion(zyz_degrees_to_matrix(*start_posx[3:]))
+                if requested_sol is None:
+                    sol, reason = determine_start_sol(node, ik_client, fk_client,
+                                                      start_joints, start_posx)
+                    if sol is None:
+                        raise InterpreterError(line, "E_UNREACHABLE_CONFIG",
+                                               f"Cannot infer LIN start branch: {reason}.")
+                    note("lin_sol_asserted_from_start", line=line, sol=sol)
+                else:
+                    sol = requested_sol
+                    assert_start_branch(node, ik_client, fk_client, start_joints,
+                                        start_posx, sol, line)
+                end_joints, distance_mm, rotation_deg, segments = preflight_lin(
+                    node, ik_client, fk_client, start_joints, start_posx, start_quat,
+                    end_pos_mm, end_quat, sol, line)
+                end_posx = posx_from_pose(end_pos_mm, end_quat)
+                if distance_mm < LIN_MIN_POS_FOR_TRANSLATION_MM:
+                    note("warning", line=line,
+                         detail=f"LIN pure rotation ({distance_mm:.3f} mm): translational "
+                                "speed is irrelevant; rotational back-end default is used.")
                 if ENABLE_MOTION:
-                    request = MoveLine.Request()
-                    request.pos = [float(v) for v in end_posx]
-                    # vel = [mm/s, deg/s], acc = [mm/s^2, deg/s^2]
-                    request.vel = [float(velocity * 1000.0),
-                                   float(LIN_DEFAULT_ROT_VEL_DEG_S)]
-                    request.acc = [float(acceleration * 1000.0),
-                                   float(LIN_DEFAULT_ROT_ACC_DEG_S2)]
-                    request.time, request.radius = 0.0, 0.0
-                    request.ref = 0        # DR_BASE; set to 2 for DR_WORLD if applicable
-                    request.mode = 0       # absolute
-                    request.blend_type, request.sync_type = 0, 0
-                    call_service(node, move_line_client, request,
-                                 "the MoveLine command",
-                                 lin_timeout(distance_mm, velocity))
-                current = end_joints
-                emit(line, "ok", payload={"sol": sol, "mode": "lin",
-                                          "posx_mm_zyz_deg": [round(v, 4) for v in end_posx],
-                                          "posj": [round(a, 4) for a in end_joints],
-                                          "distance_mm": round(distance_mm, 3),
-                                          "motion": ENABLE_MOTION})
+                    # IK/FK preflight can take time: recheck WORLD, TCP and start state.
+                    now = current_joints(node, position_client)
+                    assert_cartesian_setup(node, position_client, fk_client, tcp_client,
+                                           current_posx_client, flange_posx_client, line, now)
+                    if max_joint_jump_deg(now, start_joints) > LIN_BRANCH_MATCH_TOL_DEG:
+                        raise InterpreterError(line, "E_DEVICE",
+                                               "Start joints changed during LIN preflight.")
+                    issue_move_line(node, move_line_client, end_posx, velocity, acceleration,
+                                    distance_mm, rotation_deg)
+                    actual = current_joints(node, position_client)
+                    mismatch = max_joint_jump_deg(actual, end_joints)
+                    if mismatch > LIN_BRANCH_MATCH_TOL_DEG:
+                        raise InterpreterError(
+                            line, "E_CONFIG_CHANGE",
+                            f"LIN controller end state differs from preflight sol={sol} by "
+                            f"{mismatch:.2f} deg; possible controller-side branch switch.")
+                emit(line, "ok", payload={
+                    "sol": sol, "mode": "lin",
+                    "posx_mm_zyz_deg": [round(v, 4) for v in end_posx],
+                    "posj": [round(a, 4) for a in end_joints],
+                    "distance_mm": round(distance_mm, 3),
+                    "rotation_deg": round(rotation_deg, 3),
+                    "preflight_segments": segments, "motion": ENABLE_MOTION,
+                })
+                continue
+            raise RuntimeError(f"Internal error: unknown planned task {task!r}.")
         except RuntimeError as error:
             emit(line, "error", "E_DEVICE", str(error))
             return 1
@@ -878,48 +989,59 @@ def execute_plan(node, position_client, move_client, move_jointx_client,
     return 0
 
 
+import os
+
+
 def main():
-    self_test()
+    if os.environ.get("RTSL_SELF_TEST") == "1":
+        self_test()
     rclpy.init()
     node = rclpy.create_node("rtsl_doosan_executor")
     try:
         initial = initial_modal_values()
         report_initial_values(initial)
-
         with INSTRUCTION_FILE.open(encoding="utf-8") as file:
             plan = parse_program(json.load(file), initial)
 
         position_client = node.create_client(GetCurrentPosj, POSITION_SERVICE)
         ik_client = node.create_client(Ikin, IKIN_SERVICE)
         move_client = node.create_client(MoveJoint, MOVE_JOINT_SERVICE)
-        move_jointx_client = node.create_client(MoveJointx, MOVE_JOINTX_SERVICE)
         move_line_client = node.create_client(MoveLine, MOVE_LINE_SERVICE)
         fk_client = node.create_client(Fkin, FKIN_SERVICE) if HAVE_FKIN else None
 
-        wait_for_service(position_client, POSITION_SERVICE)
-
-        needs_ik = any(task in ("move-ee-ptp", "move-ee-lin") for _, task, _ in plan)
+        needs_cartesian = any(task in {"move-ee-ptp", "move-ee-lin"}
+                              for _, task, _ in plan)
         needs_lin = any(task == "move-ee-lin" for _, task, _ in plan)
+        needs_joint_motion = any(task in {"ptp", "move-ee-ptp"}
+                                 for _, task, _ in plan)
 
-        if needs_ik:
+        # Fail before even earlier joint instructions if a later Cartesian task
+        # cannot be tied to the surveyed cell world and intended controller TCP.
+        if needs_cartesian:
+            frame_survey()
+
+        wait_for_service(position_client, POSITION_SERVICE)
+        current_posx_client = None
+        flange_posx_client = None
+        tcp_client = None
+        if needs_cartesian:
             wait_for_service(ik_client, IKIN_SERVICE)
-            if fk_client is not None and not wait_for_service(fk_client, FKIN_SERVICE,
-                                                              required=False):
-                fk_client = None
-            if needs_lin and fk_client is None:
-                raise RuntimeError("LIN motion requires Fkin; service unavailable.")
-            plan = resolve_move_ee_plan(node, position_client, ik_client, fk_client, plan)
-            if ENABLE_MOTION:
-                if any(task == "move-ee-ptp" for _, task, _ in plan):
-                    wait_for_service(move_jointx_client, MOVE_JOINTX_SERVICE)
-                if needs_lin:
-                    wait_for_service(move_line_client, MOVE_LINE_SERVICE)
-
-        if ENABLE_MOTION and any(task == "ptp" for _, task, _ in plan):
+            if fk_client is None or not wait_for_service(fk_client, FKIN_SERVICE, required=False):
+                raise RuntimeError("move-ee requires Fkin for IK round-trip validation.")
+            current_posx_client = node.create_client(GetCurrentPosx, CURRENT_POSX_SERVICE)
+            flange_posx_client = node.create_client(GetCurrentToolFlangePosx, FLANGE_POSX_SERVICE)
+            tcp_client = node.create_client(GetCurrentTcp, CURRENT_TCP_SERVICE)
+            wait_for_service(current_posx_client, CURRENT_POSX_SERVICE)
+            wait_for_service(flange_posx_client, FLANGE_POSX_SERVICE)
+            wait_for_service(tcp_client, CURRENT_TCP_SERVICE)
+            assert_cartesian_setup(node, position_client, fk_client, tcp_client,
+                                   current_posx_client, flange_posx_client, 0)
+        if ENABLE_MOTION and needs_joint_motion:
             wait_for_service(move_client, MOVE_JOINT_SERVICE)
-
-        return execute_plan(node, position_client, move_client, move_jointx_client,
-                            move_line_client, plan)
+        if ENABLE_MOTION and needs_lin:
+            wait_for_service(move_line_client, MOVE_LINE_SERVICE)
+        return execute_plan(node, position_client, current_posx_client, flange_posx_client,
+                            tcp_client, ik_client, fk_client, move_client, move_line_client, plan)
     except InterpreterError as error:
         emit(error.line, "error", error.code, error.message)
         return 1

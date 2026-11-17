@@ -6,6 +6,11 @@
   {"task": "wait", "value": 2.0},
   {"task": "move_joint", "value": [1.73, -17.24, 103.47, -7.97, 3.37, 0], "vel": 0.1, "acc": 0.1},
   {"task": "wait", "value": 1.0},
+  
+  {"task":"gripper", "action":"open",  "port":3, "close_level":1},
+  {"task":"wait", "value":2},
+  {"task":"gripper", "action":"close", "port":3, "close_level":1},
+
   {
     "task": "move-ee",
     "mode": "ptp",
